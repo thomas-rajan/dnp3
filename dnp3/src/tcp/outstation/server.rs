@@ -13,8 +13,26 @@ use crate::util::channel::Sender;
 use crate::util::phys::{PhysAddr, PhysLayer};
 use crate::util::session::{Enabled, Session};
 use crate::util::shutdown::ShutdownListener;
-use std::net::SocketAddr;
+use std::ffi::CString;
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
+use tokio::net::TcpSocket;
 use tracing::Instrument;
+
+/// Allow binding using socket address or network interface name
+#[derive(Debug)]
+pub enum BindParam {
+    /// socket address
+    Address(SocketAddr),
+    /// network interface
+    NetInterface {
+        /// interface name for socket to bind
+        ifname: String,
+        /// ipv4 or ipv6
+        isv4: bool,
+        /// port number for socket to bind
+        port: u16,
+    },
+}
 
 struct OutstationInfo {
     filter: AddressFilter,
@@ -28,7 +46,7 @@ struct OutstationInfo {
 pub struct Server {
     link_modes: LinkModes,
     connection_id: u64,
-    address: SocketAddr,
+    bind_param: BindParam,
     outstations: Vec<OutstationInfo>,
     connection_handler: ServerConnectionHandler,
 }
@@ -52,14 +70,14 @@ impl ServerConnectionHandler {
 impl Server {
     /// create a TCP server builder object that will eventually be bound
     /// to the specified address
-    pub fn new_tcp_server(link_error_mode: LinkErrorMode, address: SocketAddr) -> Self {
+    pub fn new_tcp_server(link_error_mode: LinkErrorMode, bind_param: BindParam) -> Self {
         Self {
             link_modes: LinkModes {
                 error_mode: link_error_mode,
                 read_mode: LinkReadMode::Stream,
             },
             connection_id: 0,
-            address,
+            bind_param,
             outstations: Vec::new(),
             connection_handler: ServerConnectionHandler::Tcp,
         }
@@ -69,13 +87,13 @@ impl Server {
     #[cfg(feature = "enable-tls")]
     pub fn new_tls_server(
         link_error_mode: LinkErrorMode,
-        address: SocketAddr,
+        bind_param: BindParam,
         tls_config: crate::tcp::tls::TlsServerConfig,
     ) -> Self {
         Self {
             link_modes: LinkModes::stream(link_error_mode),
             connection_id: 0,
-            address,
+            bind_param,
             outstations: Vec::new(),
             connection_handler: ServerConnectionHandler::Tls(tls_config),
         }
@@ -117,7 +135,19 @@ impl Server {
         };
         self.outstations.push(outstation);
 
-        let endpoint = self.address;
+        let endpoint = match &self.bind_param {
+            BindParam::Address(socket_addr) => format!(
+                "{}:{}",
+                socket_addr.ip().to_string(),
+                socket_addr.port().to_string()
+            ),
+            BindParam::NetInterface { ifname, isv4, port } => format!(
+                "{}:{}:{}",
+                ifname,
+                if *isv4 { "v4" } else { "v6" },
+                port.to_string()
+            ),
+        };
         let address = config.outstation_address.raw_value();
         let future = async move {
             let _ = adapter.run()
@@ -160,14 +190,39 @@ impl Server {
     pub async fn bind_no_spawn(
         mut self,
     ) -> Result<(ServerHandle, impl std::future::Future<Output = Shutdown>), tokio::io::Error> {
-        let listener = tokio::net::TcpListener::bind(self.address).await?;
+        let listener = match &self.bind_param {
+            BindParam::Address(socket_addr) => tokio::net::TcpListener::bind(socket_addr).await?,
+            BindParam::NetInterface { ifname, isv4, port } => {
+                let (socket, addr) = if *isv4 {
+                    (TcpSocket::new_v4()?, SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(0, 0, 0, 0), *port)))
+                } else {
+                    (TcpSocket::new_v6()?, SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 1), *port, 0, 78)))
+                };
+                let name = CString::new(ifname.as_str())?;
+                socket.bind_device(Some(name.as_bytes()))?;
+                socket.bind(addr)?;
+                socket.listen(1024)?
+            }
+        };
 
         let addr = listener.local_addr().ok();
 
         let (token, shutdown_rx) = crate::util::shutdown::shutdown_token();
 
         let task = async move {
-            let local = self.address;
+            let local = match &self.bind_param {
+                BindParam::Address(socket_addr) => format!(
+                    "{}:{}",
+                    socket_addr.ip().to_string(),
+                    socket_addr.port().to_string()
+                ),
+                BindParam::NetInterface { ifname, isv4, port } => format!(
+                    "{}:{}:{}",
+                    ifname,
+                    if *isv4 { "v4" } else { "v6" },
+                    port.to_string()
+                ),
+            };
             self.run(listener, shutdown_rx)
                 .instrument(tracing::info_span!("tcp-server", "listen" = ?local))
                 .await
