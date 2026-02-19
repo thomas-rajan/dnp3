@@ -198,6 +198,7 @@ impl Server {
                 } else {
                     (TcpSocket::new_v6()?, SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 1), *port, 0, 78)))
                 };
+                socket.set_reuseaddr(true)?;
                 let name = CString::new(ifname.as_str())?;
                 socket.bind_device(Some(name.as_bytes()))?;
                 socket.bind(addr)?;
